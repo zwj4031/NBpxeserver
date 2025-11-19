@@ -1284,9 +1284,50 @@ def run_tftp_server(cfg, stop_evt):
         log_message("TFTP: 服务器已停止。")
 
 class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
+    # 关键修改：使用HTTP/1.1协议（httpdisk需要）
+    protocol_version = 'HTTP/1.1'
+    
     def __init__(self, *args, client_manager_instance=None, **kwargs):
         self.client_manager = client_manager_instance
         super().__init__(*args, **kwargs)
+
+    def do_HEAD(self):
+        """处理HEAD请求 - httpdisk需要此方法来获取文件信息"""
+        if self.path.startswith('/dynamic.ipxe'):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        fpath = self.translate_path(self.path)
+
+        if os.path.isdir(fpath):
+            super().do_HEAD()
+            return
+
+        if not os.path.isfile(fpath):
+            self.send_error(404, "File not found")
+            return
+
+        try:
+            fs = os.stat(fpath)
+            size = fs.st_size
+            mtime = fs.st_mtime
+            
+            self.send_response(200)
+            self.send_header("Content-type", self.guess_type(fpath))
+            self.send_header("Content-Length", str(size))
+            self.send_header("Accept-Ranges", "bytes")
+            # 添加Last-Modified头部，某些客户端需要这个
+            self.send_header("Last-Modified", self.date_time_string(mtime))
+            # 添加ETag头部，提高缓存兼容性
+            etag = f'"{size}-{int(mtime)}"'
+            self.send_header("ETag", etag)
+            self.end_headers()
+            log_message(f"HTTP: [HEAD] {self.path} -> {self.client_address[0]}")
+        except OSError:
+            self.send_error(404, "File not found")
 
     def do_GET(self):
         if self.path.startswith('/dynamic.ipxe'):
@@ -1334,27 +1375,12 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         if self.client_manager:
             self.client_manager.handle_file_transfer_start(client_ip, filename)
         
-        fpath = self.translate_path(self.path)
-
-        if os.path.isdir(fpath):
-            log_message(f"HTTP: [目录浏览] 客户端 {self.client_address[0]} 正在浏览 '{self.path}'")
-            super().do_GET()
-            return
-
-        if not os.path.isfile(fpath):
-            self.send_error(404, "File not found")
-            return
-
-        filename = os.path.basename(fpath)
-        client_ip = self.client_address[0]
-        if self.client_manager:
-            self.client_manager.handle_file_transfer_start(client_ip, filename)
-        
         transfer_successful = False
         try:
             with open(fpath, 'rb') as f:
                 fs = os.fstat(f.fileno())
                 size = fs.st_size
+                mtime = fs.st_mtime
                 range_header = self.headers.get('Range')
                 
                 if not range_header:
@@ -1362,6 +1388,10 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                     self.send_header("Content-type", self.guess_type(fpath))
                     self.send_header("Content-Length", str(size))
                     self.send_header("Accept-Ranges", "bytes")
+                    # 添加Last-Modified和ETag头部
+                    self.send_header("Last-Modified", self.date_time_string(mtime))
+                    etag = f'"{size}-{int(mtime)}"'
+                    self.send_header("ETag", etag)
                     self.end_headers()
                     self.copyfile(f, self.wfile)
                     log_message(f"HTTP: [200 GET] {self.path} -> {self.client_address[0]}")
@@ -1389,6 +1419,10 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                     self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                     content_length = end - start + 1
                     self.send_header("Content-Length", str(content_length))
+                    # 添加Last-Modified和ETag头部
+                    self.send_header("Last-Modified", self.date_time_string(mtime))
+                    etag = f'"{size}-{int(mtime)}"'
+                    self.send_header("ETag", etag)
                     self.end_headers()
                     
                     f.seek(start)
@@ -1833,7 +1867,7 @@ class ConfigWindow(tk.Toplevel):
 class NBpxeApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("NBPXE 服务器 20250916")
+        self.root.title("NBPXE 服务器 20251119")
         self.root.geometry("800x600")
         main_frame = ttk.Frame(root, padding="10")
         main_frame.pack(fill="both", expand=True)
