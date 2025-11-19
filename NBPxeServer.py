@@ -5,6 +5,23 @@ import socket
 import struct
 import sys
 import threading
+# ================= Nuitka/打包 修复补丁开始 =================
+# 修复 Nuitka 使用 --windows-disable-console 打包后
+# sys.stdout 和 sys.stderr 为 None 导致的 print() 崩溃问题
+class NullWriter:
+    def write(self, data):
+        pass
+    def flush(self):
+        pass
+    def isatty(self):
+        return False
+
+if sys.stdout is None:
+    sys.stdout = NullWriter()
+
+if sys.stderr is None:
+    sys.stderr = NullWriter()
+# ================= Nuitka/打包 修复补丁结束 =================
 import time
 import os
 import configparser
