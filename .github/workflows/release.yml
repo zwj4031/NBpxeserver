@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch: # Allows manual triggering
+  workflow_dispatch:
 
 jobs:
   build:
@@ -24,7 +24,7 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0 # Required for tag-based versioning
+        fetch-depth: 0
 
     - name: Set up Python 3.8 (${{ matrix.python-arch }})
       uses: actions/setup-python@v5
@@ -37,24 +37,42 @@ jobs:
         python -m pip install --upgrade pip
         pip install nuitka zstandard ordered-set
 
-    - name: Patch Nuitka zstd memory usage (x86 only)
-      # 仅在 x86 环境下触发，把 Nuitka 写死的最高压缩级(22)降到10，避免32位系统内存溢出
+    - name: Inject GC and Low-Memory Patch (x86 only)
+      # 【终极补丁】：直接劫持 zstandard 库，强制垃圾回收和单线程低内存模式
       if: matrix.arch == 'x86'
       shell: python
       run: |
-        import re
+        import zstandard
         import pathlib
-        import nuitka.tools.onefile_compressor.OnefileCompressor as oc
-
-        # 获取 Nuitka 压缩器模块的源码路径
-        f = pathlib.Path(oc.__file__)
-        content = f.read_text(encoding='utf-8')
         
-        # 降级 zstd 压缩参数
-        patched_content = re.sub(r'level\s*=\s*\d+', 'level=10', content)
-        f.write_text(patched_content, encoding='utf-8')
+        # 准确定位 zstandard 库的加载路径
+        zstd_init = pathlib.Path(zstandard.__file__)
         
-        print("Successfully patched Nuitka zstd compression level to 10 for x86 build.")
+        patch_code = """
+        # --- NUITKA OOM PATCH START ---
+        import gc
+        _OriginalCompressor = ZstdCompressor
+        
+        def _SafeZstdCompressor(*args, **kwargs):
+            print("\\n[PATCH] 执行你在找的魔法：强制垃圾回收，释放内存！...")
+            gc.collect()  # 真正释放 Nuitka 编译阶段遗留的大量内存！
+            
+            # 锁定低内存模式与单线程（防止 GitHub Action 的 4 核 CPU 让内存需求乘以 4）
+            kwargs['level'] = 5   
+            kwargs['threads'] = 1 
+            print(f"[PATCH] 强行修改压缩参数为: {kwargs}\\n")
+            
+            return _OriginalCompressor(*args, **kwargs)
+            
+        ZstdCompressor = _SafeZstdCompressor
+        # --- NUITKA OOM PATCH END ---
+        """
+        
+        # 把补丁直接打进库文件的末尾
+        with open(zstd_init, "a", encoding="utf-8") as f:
+            f.write("\n" + patch_code + "\n")
+            
+        print("内存释放 & 单线程劫持补丁注入成功！")
 
     - name: Compile with Nuitka
       run: >
