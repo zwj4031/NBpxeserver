@@ -275,7 +275,7 @@ def create_default_ini():
     best_ip = "192.168.1.100"
     if all_ips and all_ips[0] != "127.0.0.1":
         best_ip = all_ips[0]
-    config["General"] = {"listen_ip": best_ip, "server_ip": best_ip}
+    config["General"] = {"listen_ip": best_ip, "server_ip": best_ip, "start": "0"}  #自动开启服务
     try:
         ip_parts = best_ip.split(".")
         ip_prefix = ".".join(ip_parts[:-1])
@@ -384,6 +384,7 @@ def load_config_from_ini():
             "listen_ip": g.get("listen_ip", "0.0.0.0"),
             "server_ip": g.get("server_ip", get_all_ips()[0]),
             "dhcp_enabled": d.getboolean("enabled", True),
+            "start": g.getint("start", 0), #添加自动启动
             "dhcp_mode": d.get("mode", "proxy"),
             "ip_pool_start": d.get("pool_start"),
             "ip_pool_end": d.get("pool_end"),
@@ -454,6 +455,9 @@ def save_config_to_ini():
             config["DHCPOptions"],
         )
         g["listen_ip"], g["server_ip"] = SETTINGS["listen_ip"], SETTINGS["server_ip"]
+        #自动开启服务
+        g["start"] = str(SETTINGS["start"]) 
+
         d["enabled"], d["mode"] = (
             str(SETTINGS["dhcp_enabled"]).lower(),
             SETTINGS["dhcp_mode"],
@@ -2772,6 +2776,10 @@ class NBpxeApp:
         self.create_control_widgets(control_frame)
         self.process_log_queue()
         self.update_status_display()
+        #自动开启服务
+        if SETTINGS.get("start", 0) == 1:
+            start_services()
+
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_status_widgets(self, parent):
